@@ -84,8 +84,8 @@
           busy = false;
           if (enabled) { setStatus('Diga “Jarvis”'); queueStart(); }
         }, 13000);
-      }, 9000);
-    }, 650);
+      }, 4000);
+  }, 150);
   }
   recognition = new SpeechRecognition();
   recognition.lang = 'pt-BR';
