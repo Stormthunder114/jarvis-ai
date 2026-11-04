@@ -1,0 +1,73 @@
+name: Build Jarvis Sherpa-ONNX WASM
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout Jarvis model files
+        uses: actions/checkout@v4
+
+      - name: Install system build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build make git python3 curl
+
+      - name: Download Sherpa-ONNX and Emscripten SDK
+        run: |
+          git clone --depth 1 https://github.com/k2-fsa/sherpa-onnx.git sherpa-onnx
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git emsdk
+          ./emsdk/emsdk install 4.0.23
+          ./emsdk/emsdk activate 4.0.23
+
+      - name: Prepare English Jarvis model for WASM packaging
+        shell: bash
+        run: |
+          set -euo pipefail
+          ASSETS="sherpa-onnx/wasm/kws/assets"
+          MODEL="public/static/kws"
+          # The Sherpa-ONNX WASM example expects these FP32-style filenames;
+          # the model data inside the files remains INT8 (quantized).
+          cp "$MODEL/encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx" \
+             "$ASSETS/encoder-epoch-12-avg-2-chunk-16-left-64.onnx"
+          cp "$MODEL/decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx" \
+             "$ASSETS/decoder-epoch-12-avg-2-chunk-16-left-64.onnx"
+          cp "$MODEL/joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx" \
+             "$ASSETS/joiner-epoch-12-avg-2-chunk-16-left-64.onnx"
+          cp "$MODEL/tokens.txt" "$ASSETS/tokens.txt"
+          # Other files inside assets are not needed in the preloaded model data.
+
+      - name: Compile Sherpa-ONNX keyword spotting for browser
+        shell: bash
+        run: |
+          set -euo pipefail
+          source emsdk/emsdk_env.sh
+          cd sherpa-onnx
+          ./build-wasm-simd-kws.sh
+
+      - name: Gather build outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p jarvis-wasm
+          BUILD_DIR="sherpa-onnx/build-wasm-simd-kws/install/bin/wasm"
+          cp "$BUILD_DIR/sherpa-onnx-wasm-kws-main.js" jarvis-wasm/
+          cp "$BUILD_DIR/sherpa-onnx-wasm-kws-main.wasm" jarvis-wasm/
+          cp "$BUILD_DIR/sherpa-onnx-wasm-kws-main.data" jarvis-wasm/
+          cp "$BUILD_DIR/sherpa-onnx-kws.js" jarvis-wasm/
+          cp public/static/kws/jarvis_keywords.txt jarvis-wasm/
+          ls -lh jarvis-wasm/
+
+      - name: Upload compiled browser engine
+        uses: actions/upload-artifact@v4
+        with:
+          name: jarvis-sherpa-wasm-engine
+          path: jarvis-wasm/
+          if-no-files-found: error
+          retention-days: 14
