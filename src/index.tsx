@@ -1118,6 +1118,7 @@ app.get('/', (c) => {
 
 <!-- Our JS modules (loaded as module scripts) -->
 <script type="module" src="/static/app.js"></script>
+<script defer src="/static/jarvis-wakeword.js"></script>
 
 </body>
 </html>`)
