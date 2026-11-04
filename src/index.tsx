@@ -1118,7 +1118,9 @@ app.get('/', (c) => {
 
 <!-- Our JS modules (loaded as module scripts) -->
 <script type="module" src="/static/app.js"></script>
-<script defer src="/static/jarvis-wakeword.js"></script>
+<script defer src="/static/kws/sherpa-onnx-kws.js"></script>
+<script defer src="/static/jarvis-local.js"></script>
+<script defer src="/static/kws/sherpa-onnx-wasm-kws-main.js"></script>
 
 </body>
 </html>`)
