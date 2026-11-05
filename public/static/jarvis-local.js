@@ -1,111 +1,97 @@
-/* MONZA JARVIS Web — ativacao local Sherpa-ONNX (versao de teste 1)
- * Funciona com o Sherpa-ONNX WASM compilado no workflow build-jarvis-wasm.yml.
- * Nao altera app.js nem o protocolo de voz do XiaoZhi.
- * Modelos ONNX estao incorporados no arquivo .data compilado.
+/* Local Sherpa-ONNX wake word plus continuous XiaoZhi conversation.
+ * The WASM loader/model configuration below is intentionally preserved.
  */
 (() => {
   'use strict';
-
   const KWS_DIR = '/static/kws/';
   const KEYWORDS_URL = KWS_DIR + 'jarvis_keywords.txt';
-  const COMMAND_MAX_MS = 7000;
-  const RESPONSE_GUARD_MS = 9000;
   const AUDIO_SAMPLE_RATE = 16000;
-
-  let kws = null;
-  let streamKws = null;
-  let audio = null;
-  let enabled = false;
-  let ready = false;
-  let phase = 'boot';
-  let timer = null;
-  let ownsXiaozhiMic = false;
-  let starting = false;
-  let lastWake = 0;
-
-  const panel = document.createElement('div');
-  panel.id = 'jarvisLocalPanel';
-  panel.style.cssText = 'position:fixed;right:18px;bottom:90px;z-index:10000;display:flex;align-items:center;gap:9px;padding:10px 12px;border-radius:12px;background:#152235;color:white;box-shadow:0 4px 20px #0006;font:13px system-ui,sans-serif;max-width:min(92vw,430px)';
-  const button = document.createElement('button');
-  button.id = 'jarvisLocalToggle';
-  button.type = 'button';
-  button.textContent = 'Carregando Jarvis...';
-  button.disabled = true;
-  button.style.cssText = 'border:0;background:#087de4;color:white;padding:9px 12px;border-radius:8px;cursor:pointer;font:inherit;white-space:nowrap';
-  const status = document.createElement('span');
-  status.id = 'jarvisLocalStatus';
-  status.textContent = 'Preparando modelo offline...';
-  status.setAttribute('role', 'status');
-  status.style.cssText = 'min-width:110px;overflow-wrap:anywhere';
-  panel.append(button, status);
-  document.body.appendChild(panel);
-
+  let kws = null, streamKws = null, audio = null;
+  let enabled = false, ready = false, phase = 'boot', starting = false;
+  let captureGeneration = 0, lastWake = 0;
+  const panel = document.getElementById('jarvisLocalPanel');
+  const button = document.getElementById('jarvisLocalToggle');
+  const status = document.getElementById('jarvisLocalStatus');
+  const endButton = document.getElementById('jarvisEndConversation');
+  const continuous = document.getElementById('jarvisContinuous');
+  const barge = document.getElementById('jarvisBargeIn');
+  const silence = document.getElementById('jarvisSilence');
+  const activity = document.getElementById('jarvisActivity');
   function setStatus(value) { status.textContent = value; }
   function log(...args) { console.log('[Jarvis KWS local]', ...args); }
   function err(...args) { console.error('[Jarvis KWS local]', ...args); }
-  function clearTimer() { if (timer) clearTimeout(timer); timer = null; }
-  function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
-  function micButton() { return document.getElementById('micBtn'); }
+  const dialogue = () => window.JarvisConversation;
 
-  // O segundo microfone so pertence a esta extensao quando ela propria
-  // iniciou a captura por clique. Nunca interrompe o microfone manual do usuario.
-  function releaseXiaozhiMic() {
-    if (!ownsXiaozhiMic) return;
-    ownsXiaozhiMic = false;
-    const btn = micButton();
-    if (btn && btn.classList.contains('active')) btn.click();
-  }
+  window.addEventListener('jarvis-dialogue-state', ({ detail }) => {
+    const labels = { IDLE: 'Aguardando “Jarvis”', WAKE_WORD: 'Jarvis reconhecido',
+      LISTENING: 'Ouvindo você', PROCESSING: 'Processando', SPEAKING: 'Jarvis falando' };
+    setStatus(detail.message || labels[detail.state]);
+    activity.textContent = detail.active ? (continuous.checked ? 'Conversa contínua ativa' : 'Conversa de um turno ativa') : '';
+    endButton.disabled = !detail.active;
+    phase = detail.active ? 'conversation' : 'waiting';
+    if (!detail.active && streamKws) kws.reset(streamKws);
+  });
 
   async function stopLocalCapture() {
-    const old = audio;
-    audio = null;
-    const oldKwsStream = streamKws;
-    streamKws = null;
-    if (oldKwsStream) { try { oldKwsStream.free(); } catch (_) {} }
+    captureGeneration++;
+    const old = audio; audio = null;
+    if (streamKws) { try { streamKws.free(); } catch (_) {} streamKws = null; }
     if (!old) return;
-    try { old.processor.onaudioprocess = null; old.source.disconnect(); } catch (_) {}
-    try { old.processor.disconnect(); old.gain.disconnect(); } catch (_) {}
-    try { old.stream.getTracks().forEach(track => track.stop()); } catch (_) {}
+    old.processor.onaudioprocess = null;
+    old.stream.getTracks().forEach(track => { track.onended = null; track.stop(); });
+    for (const node of [old.source, old.processor, old.gain]) { try { node.disconnect(); } catch (_) {} }
     try { await old.context.close(); } catch (_) {}
   }
+  async function disable(message = 'Conversa encerrada') {
+    enabled = false;
+    dialogue()?.end(message);
+    phase = 'off';
+    button.textContent = 'Ativar Jarvis';
+    await stopLocalCapture();
+    setStatus(message);
+  }
+  window.JarvisLocal = {
+    disable,
+    echoCancellation: () => audio?.stream.getAudioTracks()[0]?.getSettings().echoCancellation === true,
+  };
 
   async function startLocalCapture() {
     if (!ready || !enabled || audio || starting || document.hidden) return;
     starting = true;
+    const generation = ++captureGeneration;
+    let acquired = null, context = null;
     try {
-      if (!navigator.mediaDevices?.getUserMedia) throw new Error('microfone indisponivel');
-      // Com permissao concedida no primeiro clique, pode reativar apos cada resposta.
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true}
+      if (!dialogue()) throw new Error('Aplicação ainda carregando. Tente novamente.');
+      await dialogue().prepare();
+      if (!enabled || generation !== captureGeneration) return;
+      acquired = await navigator.mediaDevices.getUserMedia({
+        audio: { sampleRate: AUDIO_SAMPLE_RATE, channelCount: 1,
+          echoCancellation: true, noiseSuppression: true, autoGainControl: true }
       });
-      if (!enabled || document.hidden) { stream.getTracks().forEach(t => t.stop()); return; }
+      if (!enabled || document.hidden || generation !== captureGeneration) return;
       const Context = window.AudioContext || window.webkitAudioContext;
-      if (!Context) throw new Error('Web Audio indisponivel');
-      const context = new Context({ sampleRate:AUDIO_SAMPLE_RATE });
+      context = new Context({ sampleRate: AUDIO_SAMPLE_RATE });
       await context.resume();
-      if (!enabled || document.hidden) {
-        stream.getTracks().forEach(t => t.stop());
-        await context.close();
-        return;
-      }
-      const source = context.createMediaStreamSource(stream);
-      const processor = context.createScriptProcessor(2048, 1, 1);
-      const gain = context.createGain();
-      gain.gain.value = 0; // Sem retorno do microfone nos alto-falantes.
-      source.connect(processor);
-      processor.connect(gain);
-      gain.connect(context.destination);
-
-      audio = {stream,context,source,processor,gain};
+      if (!enabled || document.hidden || generation !== captureGeneration) return;
+      // Never send mislabelled PCM to the 16 kHz Opus encoder.
+      if (context.sampleRate !== AUDIO_SAMPLE_RATE) throw new Error('Este navegador não oferece captura a 16 kHz.');
+      const source = context.createMediaStreamSource(acquired);
+      const processor = context.createScriptProcessor(1024, 1, 1);
+      const gain = context.createGain(); gain.gain.value = 0;
+      source.connect(processor); processor.connect(gain); gain.connect(context.destination);
       streamKws = kws.createStream();
+      audio = { stream: acquired, context, source, processor, gain };
+      acquired = null; context = null;
       phase = 'waiting';
-      setStatus('Diga “Jarvis”');
-      log('Microfone local pronto, sample rate:',context.sampleRate);
+      setStatus('Aguardando “Jarvis”');
+      for (const track of audio.stream.getTracks()) track.onended = () => void disable('Microfone desconectado. Ative Jarvis novamente.');
       processor.onaudioprocess = event => {
-        if (!enabled || phase !== 'waiting' || !audio) return;
+        if (!enabled || !audio) return;
         try {
           const input = new Float32Array(event.inputBuffer.getChannelData(0));
-          streamKws.acceptWaveform(context.sampleRate, input);
+          dialogue().pcm(input);
+          if (dialogue().active || dialogue().playbackBusy()) return;
+          streamKws.acceptWaveform(AUDIO_SAMPLE_RATE, input);
           let steps = 0;
           while (kws.isReady(streamKws) && steps++ < 20) {
             kws.decode(streamKws);
@@ -115,95 +101,44 @@
               const now = Date.now();
               if (now - lastWake > 1800) {
                 lastWake = now;
-                phase = 'switching';
-                log('Palavra detectada:', result.keyword);
-                void activateXiaozhi();
+                dialogue().continuous = continuous.checked;
+                dialogue().bargeIn = barge.checked;
+                dialogue().vad.silenceMs = Number(silence.value);
+                dialogue().begin();
               }
               break;
             }
           }
-        } catch (e) {
-          err('Falha na inferencia:',e);
-          phase = 'error';
-          enabled = false;
-          button.textContent = 'Ativar Jarvis';
-          setStatus('Falha na inferencia. Veja console.');
-          void stopLocalCapture();
-        }
+        } catch (e) { err(e); void disable('Falha no áudio: ' + e.message); }
       };
     } catch (e) {
-      err('Nao foi possivel abrir microfone:',e);
-      phase = 'error';
-      enabled = false;
-      button.textContent = 'Ativar Jarvis';
-      setStatus('Erro no microfone; autorize no Chrome.');
-      await stopLocalCapture();
-    } finally { starting = false; }
-  }
-
-  async function rearm() {
-    if (!enabled || !ready || document.hidden) return;
-    clearTimer();
-    phase = 'waiting';
-    await startLocalCapture();
-  }
-
-  async function activateXiaozhi() {
-    setStatus('Jarvis reconhecido! Abrindo XiaoZhi...');
-    await stopLocalCapture(); // Libera microfone antes de iniciar o Opus/XiaoZhi.
-    if (!enabled) return;
-    const btn = micButton();
-    if (!btn || btn.disabled || btn.classList.contains('active')) {
-      setStatus('Conecte o XiaoZhi e desative o microfone manual.');
-      timer = setTimeout(() => {timer=null;void rearm();}, 1600);
-      return;
+      err(e);
+      await disable('Erro no microfone/áudio: ' + e.message);
+    } finally {
+      acquired?.getTracks().forEach(track => track.stop());
+      if (context) await context.close();
+      starting = false;
     }
-    // O codigo original do site responde ao click no botao #micBtn.
-    // A integracao MCP/Opus e mantida inteiramente no app.js original.
-    await sleep(180);
-    if (!enabled) return;
-    btn.click();
-    ownsXiaozhiMic = true;
-    phase = 'command';
-    setStatus('Fale seu comando em português...');
-    clearTimer();
-    timer = setTimeout(() => {
-      timer = null;
-      releaseXiaozhiMic();
-      phase = 'response';
-      setStatus('Aguardando resposta do XiaoZhi...');
-      // Guarda temporaria para evitar ouvir a propria resposta por voz.
-      // Etapa futura: rearmar por evento de TTS stop do app.js.
-      timer = setTimeout(() => {timer=null;void rearm();}, RESPONSE_GUARD_MS);
-    }, COMMAND_MAX_MS);
   }
-
   button.addEventListener('click', async () => {
-    if (enabled) {
-      enabled = false;
-      clearTimer();
-      phase = 'off';
-      releaseXiaozhiMic();
-      await stopLocalCapture();
-      button.textContent = 'Ativar Jarvis';
-      setStatus('Desativado');
-    } else {
-      if (!ready) return;
-      enabled = true;
-      button.textContent = 'Desativar Jarvis';
-      setStatus('Iniciando microfone local...');
-      await startLocalCapture();
-    }
+    if (enabled) { await disable('Jarvis desativado'); return; }
+    if (!ready || starting) return;
+    enabled = true;
+    button.textContent = 'Desativar Jarvis';
+    setStatus('Iniciando microfone local...');
+    await startLocalCapture();
   });
-
+  endButton.addEventListener('click', () => dialogue()?.end());
+  continuous.addEventListener('change', () => { if (dialogue()) dialogue().continuous = continuous.checked; });
+  barge.addEventListener('change', () => {
+    if (dialogue()) dialogue().bargeIn = barge.checked;
+    if (barge.checked && !window.JarvisLocal.echoCancellation()) setStatus('Interrupção indisponível até o navegador confirmar cancelamento de eco.');
+  });
+  silence.addEventListener('change', () => { if (dialogue()) dialogue().vad.silenceMs = Number(silence.value); });
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden) {
-      if (enabled && phase === 'waiting') {
-        void stopLocalCapture();
-        setStatus('Pausado: volte à aba do Jarvis');
-      }
-    } else if (enabled && phase === 'waiting') void rearm();
+    if (document.hidden && enabled) void disable('Conversa encerrada: aba em segundo plano. Ative Jarvis ao voltar.');
   });
+  window.addEventListener('pagehide', () => void disable());
 
   // O loader Emscripten chama isto quando .wasm e .data terminaram de carregar.
   // Ele precisa estar definido ANTES de carregar sherpa-onnx-wasm-kws-main.js.
