@@ -1117,6 +1117,45 @@ app.get('/', (c) => {
 <div class="toast-container" id="toastContainer"></div>
 
 <!-- Our JS modules (loaded as module scripts) -->
+<section id="jarvisLocalPanel" aria-label="Conversa por voz Jarvis">
+  <div class="jarvis-controls">
+    <button id="jarvisLocalToggle" type="button" disabled>Carregando Jarvis...</button>
+    <button id="jarvisEndConversation" type="button" disabled>Encerrar conversa</button>
+  </div>
+  <span id="jarvisLocalStatus" role="status" aria-live="polite">Preparando modelo offline...</span>
+  <strong id="jarvisActivity"></strong>
+  <details>
+    <summary>Opções de conversa</summary>
+    <label><input id="jarvisContinuous" type="checkbox" checked /> Conversa contínua</label>
+    <label>Silêncio para concluir a frase
+      <select id="jarvisSilence">
+        <option value="800">800 ms</option>
+        <option value="1000" selected>1000 ms</option>
+        <option value="1200">1200 ms</option>
+        <option value="1800">1800 ms (pausas longas)</option>
+      </select>
+    </label>
+    <label><input id="jarvisBargeIn" type="checkbox" /> Interromper por voz (experimental; use fones)</label>
+    <p>Modo padrão: alternância automática. Interrupção depende do cancelamento de eco do navegador e da confirmação do servidor; não é full-duplex garantido.</p>
+    <p>Para encerrar, diga “Jarvis, encerrar conversa”, “Jarvis, parar” ou “Jarvis, cancelar”.</p>
+  </details>
+</section>
+<style>
+  #jarvisLocalPanel { position:fixed; right:12px; bottom:90px; z-index:1000;
+    display:flex; flex-direction:column; gap:8px; padding:12px; border-radius:12px;
+    background:#152235; color:white; box-shadow:0 4px 20px #0006;
+    font:13px system-ui,sans-serif; width:min(380px,calc(100vw - 24px));
+    max-height:55dvh; overflow:auto; box-sizing:border-box; }
+  #jarvisLocalPanel .jarvis-controls { display:flex; flex-wrap:wrap; gap:8px; }
+  #jarvisLocalPanel button, #jarvisLocalPanel select { border:0; border-radius:8px;
+    padding:10px; background:#087de4; color:white; font:inherit; cursor:pointer; }
+  #jarvisLocalPanel button:disabled { opacity:.55; cursor:default; }
+  #jarvisLocalPanel label { display:block; margin-top:10px; }
+  #jarvisLocalPanel p { margin:8px 0 0; line-height:1.4; }
+  #jarvisLocalPanel summary { cursor:pointer; }
+  #jarvisActivity:empty { display:none; }
+  @media (max-width:600px) { #jarvisLocalPanel { bottom:82px; font-size:12px; } }
+</style>
 <script type="module" src="/static/app.js"></script>
 <script defer src="/static/kws/sherpa-onnx-kws.js"></script>
 <script defer src="/static/jarvis-local.js"></script>
