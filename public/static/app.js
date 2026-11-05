@@ -122,6 +122,8 @@
 
 'use strict';
 
+import { DialogueController } from './dialogue.js';
+
 // ================================================================
 // MODULE: Logger
 // Outputs to debug console panel with timestamps and tags
@@ -1826,6 +1828,20 @@ const AudioEngine = (() => {
   let isCapturing = false;
   let onAudioChunkCallback = null;
   let ttsQueue = [];
+  let playbackGeneration = 0;
+  const playbackSources = new Set();
+  function playbackBusy() { return isTTSPlaying || ttsQueue.length > 0 || playbackSources.size > 0; }
+  function notifyPlaybackDrained() {
+    if (!playbackBusy()) window.JarvisConversation?.playbackDrained();
+  }
+  function trackPlayback(source) {
+    playbackSources.add(source);
+    source.onended = () => {
+      playbackSources.delete(source);
+      source.disconnect();
+      notifyPlaybackDrained();
+    };
+  }
   let isTTSPlaying = false;
 
   // ── PER-ASSISTANT SPEECH VOLUME  [OLIVIA FEATURE] ──────────────────
@@ -2212,12 +2228,24 @@ const AudioEngine = (() => {
     if (!isTTSPlaying) {
       isTTSPlaying = true;
       // Drain the queue asynchronously without blocking the caller
-      drainTTSQueue().catch(err => Logger.error('TTS drain error', err.message));
+      startTTSDrain();
     }
   }
 
+  function startTTSDrain() {
+    const generation = playbackGeneration;
+    drainTTSQueue().catch(err => {
+      Logger.error('TTS drain error', err.message);
+      if (generation !== playbackGeneration) return;
+      clearTTSQueue();
+      if (window.JarvisConversation?.active) window.JarvisConversation.end('Conversa encerrada: falha na reprodução de áudio.');
+    });
+  }
+
   async function drainTTSQueue() {
+    const generation = playbackGeneration;
     await ensureAudioContext();
+    if (generation !== playbackGeneration) return;
 
     // Lazily initialize the decoder once (reuse across all TTS chunks)
     let decoder = null;
@@ -2227,6 +2255,8 @@ const AudioEngine = (() => {
       Logger.warn('Opus decoder unavailable, TTS will use Web Audio fallback', e.message);
     }
 
+    if (generation !== playbackGeneration) return;
+
     // Align scheduling clock to slightly ahead of "now" to avoid underruns
     const BUFFER_AHEAD_S = 0.1;  // 100ms lookahead
     if (ttsNextStartTime < audioContext.currentTime) {
@@ -2234,6 +2264,7 @@ const AudioEngine = (() => {
     }
 
     while (ttsQueue.length > 0) {
+      if (generation !== playbackGeneration) return;
       const chunk = ttsQueue.shift();
       let pcmFloat = null;
 
@@ -2258,6 +2289,7 @@ const AudioEngine = (() => {
         try {
           const buf = chunk instanceof ArrayBuffer ? chunk : chunk.buffer;
           const audioBuffer = await audioContext.decodeAudioData(buf.slice(0));
+          if (generation !== playbackGeneration) return;
           // Schedule this frame back-to-back with the previous one
           const source = audioContext.createBufferSource();
           source.buffer = audioBuffer;
@@ -2265,6 +2297,7 @@ const AudioEngine = (() => {
           // node instead of straight to destination, so the slider/NL
           // volume commands affect this fallback path too.
           source.connect(ensureGainNode() || audioContext.destination);
+          trackPlayback(source);
           source.start(ttsNextStartTime);
           ttsNextStartTime += audioBuffer.duration;
           Logger.audio(`TTS (Web Audio fallback): ${audioBuffer.duration.toFixed(3)}s @ t=${ttsNextStartTime.toFixed(3)}`);
@@ -2285,23 +2318,33 @@ const AudioEngine = (() => {
       // gain node (see ensureGainNode / setVolume above) instead of
       // connecting straight to destination.
       source.connect(ensureGainNode() || audioContext.destination);
+      trackPlayback(source);
       source.start(ttsNextStartTime);
       ttsNextStartTime += frameDurationS;
       Logger.audio(`TTS chunk: ${pcmFloat.length} samples (${(frameDurationS * 1000).toFixed(0)}ms) @ t=${ttsNextStartTime.toFixed(3)}`);
     }
 
+    if (generation !== playbackGeneration) return;
     isTTSPlaying = false;
+    notifyPlaybackDrained();
   }
 
   async function processTTSQueue() {
     // Kept for backward compat — delegates to drainTTSQueue
     if (!isTTSPlaying) {
       isTTSPlaying = true;
-      drainTTSQueue().catch(err => Logger.error('TTS drain error', err.message));
+      startTTSDrain();
     }
   }
 
   function clearTTSQueue() {
+    playbackGeneration++;
+    for (const source of playbackSources) {
+      source.onended = null;
+      try { source.stop(); } catch (_) { /* already ended */ }
+      source.disconnect();
+    }
+    playbackSources.clear();
     ttsQueue = [];
     isTTSPlaying = false;
     // Reset the scheduling clock so the next TTS starts immediately
@@ -2321,6 +2364,12 @@ const AudioEngine = (() => {
   return {
     startCapture,
     stopCapture,
+    playbackBusy,
+    prepareEncoder: getEncoder,
+    async encodeFrame(frame) {
+      const packet = await encodeFloat32Frame(frame);
+      return packet?.buffer.slice(packet.byteOffset, packet.byteOffset + packet.byteLength);
+    },
     enqueueTTSChunk,
     clearTTSQueue,
     isCapturing: () => isCapturing,
@@ -2625,7 +2674,8 @@ const ProtocolClient = (() => {
     // screen is allowed to play TTS audio through it. A background
     // assistant's audio is still fully tracked (state, messages) — it
     // just doesn't make sound until the user switches to it.
-    if (isActive() && getSetting('ttsPlayback')) {
+    if (isActive() && getSetting('ttsPlayback') &&
+        (!window.JarvisConversation || window.JarvisConversation.allowAudio(SessionManager.getActiveSession()))) {
       AudioEngine.enqueueTTSChunk(opusPayload);
     }
   }
@@ -3217,7 +3267,7 @@ const ProtocolClient = (() => {
     };
     Logger.proto('→ abort', msg);
     deviceEmulator.setState(deviceEmulator.STATES.IDLE);
-    AudioEngine.clearTTSQueue();
+    if (isActive()) AudioEngine.clearTTSQueue();
     return sendText(msg);
   }
 
@@ -3334,6 +3384,8 @@ const ChatEngine = (() => {
    *   { "session_id":"...", "type":"listen", "state":"detect", "text":"Hi XiaoZhi" }
    */
   async function sendTextMessage(text) {
+    await window.JarvisLocal?.disable('Conversa encerrada: entrada por texto.');
+    window.JarvisConversation?.release();
     if (!protocol.isConnected()) {
       Logger.warn('Cannot send message: not connected');
       showToast('Not connected to server', 'error');
@@ -3447,6 +3499,8 @@ const ChatEngine = (() => {
    * 4. When done: stopVoiceInput() sends listen{stop}
    */
   async function startVoiceInput(mode = 'auto') {
+    await window.JarvisLocal?.disable('Conversa encerrada: microfone manual ativado.');
+    window.JarvisConversation?.release();
     if (!protocol.isConnected()) {
       showToast('Not connected to server', 'error');
       return false;
@@ -3978,9 +4032,10 @@ const SessionManager = (() => {
     });
 
     protocol.on('disconnected', (code, reason) => {
+      if (window.JarvisConversation?.session === session) window.JarvisConversation.end('Conversa encerrada: conexão perdida. Reconecte e diga Jarvis.');
       Logger.ws(`[${assistantId.slice(0, 8)}] Disconnected: ${code} ${reason}`);
       AssistantManager.setConnectionStatus(assistantId, 'disconnected');
-      AudioEngine.clearTTSQueue();
+      if (isActiveId(assistantId)) AudioEngine.clearTTSQueue();
       if (isActiveId(assistantId)) {
         UIController.setConnectionState('disconnected');
         UIController.updateSessionId('');
@@ -3995,6 +4050,7 @@ const SessionManager = (() => {
     });
 
     protocol.on('error', (message) => {
+      if (window.JarvisConversation?.session === session) window.JarvisConversation.end('Conversa encerrada: erro de conexão.');
       Logger.error(`[${assistantId.slice(0, 8)}] Protocol error`, message);
       AssistantManager.setConnectionStatus(assistantId, 'disconnected');
       if (isActiveId(assistantId)) {
@@ -4006,6 +4062,7 @@ const SessionManager = (() => {
     });
 
     protocol.on('stt', (text, sessionId) => {
+      window.JarvisConversation?.stt(session, text || '');
       Logger.chat(`[${assistantId.slice(0, 8)}] STT received: "${text}"`);
       if (isActiveId(assistantId)) UIController.hideSTTPreview();
 
@@ -4025,6 +4082,7 @@ const SessionManager = (() => {
     });
 
     protocol.on('ttsStart', (sessionId) => {
+      window.JarvisConversation?.ttsStart(session);
       Logger.chat(`[${assistantId.slice(0, 8)}] TTS started`);
       if (isActiveId(assistantId)) {
         UIController.hideTypingIndicator();
@@ -4047,12 +4105,13 @@ const SessionManager = (() => {
         UIController.setConnectionState('connected');
       }
       chat.finalizeAIResponse();
+      window.JarvisConversation?.ttsStop(session);
 
       // Auto-listen mode: restart listening after AI speaks. Only makes
       // sense for the assistant whose mic is actually capturing — that
       // can only ever be the active assistant (AudioEngine mic capture
       // is a single shared hardware resource, same as TTS playback).
-      if (isActiveId(assistantId) &&
+      if (!window.JarvisConversation?.active && isActiveId(assistantId) &&
           AssistantManager.getFlatField(assistantId, 'listeningMode') === 'auto' &&
           AudioEngine.isCapturing()) {
         protocol.sendListenStart('auto');
@@ -4099,6 +4158,7 @@ const SessionManager = (() => {
    * touching any other session's connection.
    */
   function switchTo(assistantId) {
+    if (assistantId !== AssistantManager.getActiveId()) window.JarvisLocal?.disable('Conversa encerrada: assistente alterado.');
     const switched = AssistantManager.setActive(assistantId);
     if (!switched) return false;
 
@@ -6321,6 +6381,23 @@ window.addEventListener('beforeunload', () => {
     }
   });
 });
+
+// One controller owns one existing XiaoZhi session; it never reconnects per turn.
+window.JarvisConversation = new DialogueController({
+  session: () => SessionManager.getActiveSession(),
+  canStart: () => !AudioEngine.isCapturing() && !AudioEngine.playbackBusy() &&
+    AssistantManager.getFlatField(AssistantManager.getActiveId(), 'audioEnabled'),
+  encode: frame => AudioEngine.encodeFrame(frame),
+  clearPlayback: () => AudioEngine.clearTTSQueue(),
+  playbackBusy: () => AudioEngine.playbackBusy(),
+  echoCancellation: () => window.JarvisLocal?.echoCancellation() === true,
+  state: (state, message, active) => window.dispatchEvent(new CustomEvent('jarvis-dialogue-state', { detail: { state, message, active } })),
+});
+window.JarvisConversation.prepare = async () => {
+  await AudioEngine.ensureAudioContext();
+  await AudioEngine.prepareEncoder();
+};
+window.JarvisConversation.playbackBusy = () => AudioEngine.playbackBusy();
 
 // Expose to browser console for debugging.
 // PHASE 2 CHANGE: ProtocolClient/ProvisioningManager/DeviceEmulator/
